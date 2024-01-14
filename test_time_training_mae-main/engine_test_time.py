@@ -8,6 +8,7 @@
 # DeiT: https://github.com/facebookresearch/deit
 # BEiT: https://github.com/microsoft/unilm/tree/master/beit
 # --------------------------------------------------------
+
 import math
 import sys
 from typing import Iterable
@@ -79,11 +80,13 @@ def train_on_test(base_model: torch.nn.Module,
                   base_optimizer,
                   base_scalar,
                   dataset_train, dataset_val,
+                  dataset_eval,     
                   device: torch.device,
                   log_writer=None,
                   args=None,
                   num_classes: int = 1000, 
-                  iter_start: int = 0):
+                  iter_start: int = 0, 
+                  n_eval = None):
     if args.model == 'mae_vit_small_patch16':
         classifier_depth = 8
         classifier_embed_dim = 512
@@ -101,77 +104,134 @@ def train_on_test(base_model: torch.nn.Module,
     # Intialize the model for the current run
     all_results = [list() for i in range(args.steps_per_example)]
     all_losses =  [list() for i in range(args.steps_per_example)]
+
     metric_logger = misc.MetricLogger(delimiter="  ")
-    train_loader = iter(torch.utils.data.DataLoader(dataset_train, batch_size=1, shuffle=False, num_workers=args.num_workers))
-    val_loader = iter(torch.utils.data.DataLoader(dataset_val, batch_size=1, shuffle=False, num_workers=args.num_workers))
+    train_loader = [iter(torch.utils.data.DataLoader(d, batch_size=1, shuffle=False, num_workers=args.num_workers)) for d in dataset_train]
+    val_loader = [iter(torch.utils.data.DataLoader(d, batch_size=1, shuffle=False, num_workers=args.num_workers)) for d in dataset_val]
+    if args.online: 
+        all_acc_eval = []
+        eval_loader = [list(torch.utils.data.DataLoader(d, batch_size=1, shuffle=False, num_workers=args.num_workers)) for d in dataset_eval]
+
     accum_iter = args.accum_iter
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     
-    model, optimizer, loss_scaler = _reinitialize_model(base_model, base_optimizer, base_scalar, clone_model, args, device)
+    # Initialize evaluation images
+    # Save classes
+
+    if args.sequential:
+        model, optimizer, loss_scaler = _reinitialize_model(base_model, base_optimizer, base_scalar, clone_model, args, device)
+        model.load_state_dict(torch.load(args.path_model))
+    else:
+        model, optimizer, loss_scaler = _reinitialize_model(base_model, base_optimizer, base_scalar, clone_model, args, device)
+    
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
-    dataset_len = len(dataset_val)
-    for data_iter_step in range(iter_start, dataset_len):
-        val_data = next(val_loader)
-        (test_samples, test_label) = val_data
-        test_samples = test_samples.to(device, non_blocking=True)[0]
-        test_label = test_label.to(device, non_blocking=True)
-        pseudo_labels = None
-        # Test time training:
-        for step_per_example in range(args.steps_per_example * accum_iter):
-            train_data = next(train_loader)
-            # Train data are 2 values [image, class]
-            mask_ratio = args.mask_ratio
-            samples, _ = train_data
-            targets_rot, samples_rot = None, None
-            samples = samples.to(device, non_blocking=True)[0] # index [0] becuase the data is batched to have size 1.
-            loss_dict, _, _, _ = model(samples, None, mask_ratio=mask_ratio)
-            loss = torch.stack([loss_dict[l] for l in loss_dict]).sum()
-            loss_value = loss.item()
-            loss /= accum_iter
-            if not math.isfinite(loss_value):
-                print("Loss is {}, stopping training".format(loss_value))
-                sys.exit(1)
-            loss_scaler(loss, optimizer, parameters=model.parameters(),
-                        update_grad=(step_per_example + 1) % accum_iter == 0)
-            if (step_per_example + 1) % accum_iter == 0:
-                if args.verbose:
-                    print(f'datapoint {data_iter_step} iter {step_per_example}: rec_loss {loss_value}')
-                
-                all_losses[step_per_example // accum_iter].append(loss_value/accum_iter)
-                optimizer.zero_grad()
+    nb_datasets = len(dataset_val)
+    dataset_len = len(dataset_val[0])
+    eval_len = len(eval_loader[0])
+
+    print("Lenghts :\n ---- DATASETS {}\n ---- LEN {}\n ---- LEN EVAL {}".format(nb_datasets, dataset_len, eval_len))
+
+    id_dataset = 0
+    for data_iter_step in range(iter_start, nb_datasets*dataset_len):
+
+        try:
+            val_data = next(val_loader[id_dataset])
+            (test_samples, test_label) = val_data
+            test_samples = test_samples.to(device, non_blocking=True)[0]
+            test_label = test_label.to(device, non_blocking=True)
+
+            pseudo_labels = None
+            # Test time training:
+            for step_per_example in range(args.steps_per_example * accum_iter):
+                train_data = next(train_loader[id_dataset])
+                # Train data are 2 values [image, class]
+                mask_ratio = args.mask_ratio
+                samples, _ = train_data
+                samples = samples.to(device, non_blocking=True)[0] # index [0] becuase the data is batched to have size 1.
+                loss_dict, _, _, _ = model(samples, None, mask_ratio=mask_ratio)
+                loss = torch.stack([loss_dict[l] for l in loss_dict]).sum()
+                loss_value = loss.item()
+                loss /= accum_iter
+                if not math.isfinite(loss_value):
+                    print("Loss is {}, stopping training".format(loss_value))
+                    sys.exit(1)
+                loss_scaler(loss, optimizer, parameters=model.parameters(),
+                            update_grad=(step_per_example + 1) % accum_iter == 0)
+                if (step_per_example + 1) % accum_iter == 0:
+                    if args.verbose:
+                        print(f'datapoint {data_iter_step} iter {step_per_example}: rec_loss {loss_value}')
                     
-            metric_logger.update(**{k:v.item() for k,v in loss_dict.items()})
-            lr = optimizer.param_groups[0]["lr"]
-            metric_logger.update(lr=lr)
-            # Test:
-            if (step_per_example + 1) % accum_iter == 0:
+                    all_losses[step_per_example // accum_iter].append(loss_value/accum_iter)
+                    optimizer.zero_grad()
+                        
+                metric_logger.update(**{k:v.item() for k,v in loss_dict.items()})
+                lr = optimizer.param_groups[0]["lr"]
+                metric_logger.update(lr=lr)
+                # Test:
+                if (step_per_example + 1) % accum_iter == 0:
+                    with torch.no_grad():
+                        model.eval()
+                        all_pred = []
+                        for _ in range(accum_iter):
+                            
+                            loss_d, _, _, pred = model(test_samples, test_label, mask_ratio=0, reconstruct=False)
+                            if args.verbose:
+                                cls_loss = loss_d['classification'].item()
+                                print(f'datapoint {data_iter_step} iter {step_per_example}: class_loss {cls_loss}')
+                            all_pred.extend(list(pred.argmax(axis=1).detach().cpu().numpy()))
+                        acc1 = (stats.mode(all_pred).mode[0] == test_label[0].cpu().detach().numpy()) * 100.
+                        if (step_per_example + 1) // accum_iter == args.steps_per_example:
+                            metric_logger.update(top1_acc=acc1)
+                            metric_logger.update(loss=loss_value)
+                        all_results[step_per_example // accum_iter].append(acc1)
+                        model.train()
+                
+
+            # Evalute model every 100 iterations of Online-ttt
+            if data_iter_step % 100 == 1 and args.online:
+                acc_step = 0
                 with torch.no_grad():
                     model.eval()
-                    all_pred = []
-                    for _ in range(accum_iter):
-                        loss_d, _, _, pred = model(test_samples, test_label, mask_ratio=0, reconstruct=False)
-                        if args.verbose:
-                            cls_loss = loss_d['classification'].item()
-                            print(f'datapoint {data_iter_step} iter {step_per_example}: class_loss {cls_loss}')
-                        all_pred.extend(list(pred.argmax(axis=1).detach().cpu().numpy()))
-                    acc1 = (stats.mode(all_pred).mode[0] == test_label[0].cpu().detach().numpy()) * 100.
-                    if (step_per_example + 1) // accum_iter == args.steps_per_example:
-                        metric_logger.update(top1_acc=acc1)
-                        metric_logger.update(loss=loss_value)
-                    all_results[step_per_example // accum_iter].append(acc1)
+                    for i in range(eval_len):
+                        (eval_samples, eval_labels) = eval_loader[id_dataset][i]
+                        eval_samples = eval_samples.squeeze(dim=(0))
+                        eval_samples = eval_samples.to(device, non_blocking=True)
+                        eval_labels = eval_labels.to(device, non_blocking=True)
+                        loss_eval, _, _, pred_eval = model(eval_samples, eval_labels, mask_ratio=0, reconstruct=False)
+                        top_preds = list(pred_eval.argmax(axis=1).detach().cpu().numpy())
+                        acc_batch = np.sum(top_preds == eval_labels.detach().cpu().numpy())
+                        acc_step += acc_batch/eval_len
+                    print(f'STEP ACCURACY: {np.round(acc_step*100, 1)}%')
                     model.train()
-        if data_iter_step % 50 == 1:
-            print('step: {}, acc {} rec-loss {}'.format(data_iter_step, np.mean(all_results[-1]), loss_value))
-        if data_iter_step % 500 == 499 or (data_iter_step == dataset_len - 1):
-            with open(os.path.join(args.output_dir, f'results_{data_iter_step}.npy'), 'wb') as f:
-                np.save(f, np.array(all_results))
-            with open(os.path.join(args.output_dir, f'losses_{data_iter_step}.npy'), 'wb') as f:
-                np.save(f, np.array(all_losses))
-            all_results = [list() for i in range(args.steps_per_example)]
-            all_losses = [list() for i in range(args.steps_per_example)]
-        model, optimizer, loss_scaler = _reinitialize_model(base_model, base_optimizer, base_scalar, clone_model, args, device)
+                # Store eval  
+                all_acc_eval.append(acc_step) 
+
+            if data_iter_step % 50 == 1:
+                print('step: {}, acc {} rec-loss {}'.format(data_iter_step, np.mean(all_results[-1]), loss_value))
+            if data_iter_step % 500 == 499 or (data_iter_step == dataset_len - 1):
+                with open(os.path.join(args.output_dir, f'results_{data_iter_step}.npy'), 'wb') as f:
+                    np.save(f, np.array(all_results))
+                with open(os.path.join(args.output_dir, f'losses_{data_iter_step}.npy'), 'wb') as f:
+                    np.save(f, np.array(all_losses))
+                all_results = [list() for i in range(args.steps_per_example)]
+                all_losses = [list() for i in range(args.steps_per_example)]
+            #model, optimizer, loss_scaler = _reinitialize_model(base_model, base_optimizer, base_scalar, clone_model, args, device)
+        except StopIteration:
+            id_dataset += 1
+
     save_accuracy_results(args)
+
+
+    with open(os.path.join(args.output_dir, 'model.pth'), 'wb') as f:
+              torch.save(model, f)
+
+    # Save evaluation accuracy
+    if args.online: 
+        with open(os.path.join(args.output_dir, 'eval_accuracy.npy'), 'wb') as f:
+                np.save(f, np.array(all_acc_eval))
+
+
     # gather the stats from all processes
     try:
         print("Averaged stats:", metric_logger)
@@ -192,5 +252,4 @@ def save_accuracy_results(args):
     with open(os.path.join(args.output_dir, 'accuracy.txt'), 'a') as f:
         f.write(f'{str(args)}\n')
         for i in range(args.steps_per_example):
-            assert len(all_all_results[i]) == 50000, len(all_all_results[i])
             f.write(f'{i}\t{np.mean(all_all_results[i])}\n')
