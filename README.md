@@ -16,6 +16,8 @@ Codebase studying Test Time Training with MAE for image classification based on 
 
 - Marguerite PETIT TALAMON
 
+
+...
 @inproceedings{
         gandelsman2022testtime,
         title={Test-Time Training with Masked Autoencoders},
@@ -25,3 +27,4 @@ Codebase studying Test Time Training with MAE for image classification based on 
         year={2022},
         url={https://openreview.net/forum?id=SHMi1b7sjXk}
 }
+...
